@@ -46,7 +46,8 @@ OUT_FPS = 60
 SS = 2  # supersampling factor for the bar (rendered at 2x, downscaled)
 
 TICK = 0.25         # live-FPS sample interval (4 Hz)
-WINDOW = 0.5        # live-FPS smoothing window
+WINDOW = 1.0        # live-FPS smoothing window (seconds of real data)
+STABILITY_WEIGHT = 0.5  # window scoring: impact vs. counter steadiness
 
 BAR_BG = (7, 9, 14, 184)          # rgba(7,9,14,0.72)
 BAR_BORDER = (255, 255, 255, 36)  # rgba(255,255,255,0.14)
@@ -164,12 +165,11 @@ def live_fps(times, t):
 
 
 def impact_text(base_avg, app_avg):
-    if app_avg >= base_avg:
-        return "0%"
-    impact = (base_avg - app_avg) / base_avg * 100.0
-    if impact < 1.0:
+    """Signed FPS difference with the app: -X% loss, +X% gain, <1% if tiny."""
+    diff = (app_avg - base_avg) / base_avg * 100.0
+    if abs(diff) < 1.0:
         return "<1%"
-    return f"-{round(impact)}%"
+    return f"{'+' if diff > 0 else '-'}{round(abs(diff))}%"
 
 
 def window_avg_fps(times, t0, t1):
@@ -177,29 +177,58 @@ def window_avg_fps(times, t0, t1):
     return n / (t1 - t0)
 
 
+def live_fps_series(times):
+    """Live FPS at every absolute TICK-grid time covered by the capture.
+    Returns (first_grid_index, values)."""
+    k0 = math.ceil((times[0] + WINDOW) / TICK)
+    k1 = math.floor(times[-1] / TICK)
+    return k0, [live_fps(times, k * TICK) for k in range(k0, k1 + 1)]
+
+
 def find_best_start(base_times, app_times, duration):
     """Scan both captures (in TICK steps) for the clip-length window where
-    the app's FPS impact vs. baseline is smallest; returns (start, impact)."""
-    lo = max(base_times[0], app_times[0]) + WINDOW
-    hi = min(base_times[-1], app_times[-1]) - duration
-    if hi <= lo:
+    the app's FPS impact vs. baseline is smallest AND the live counters are
+    steady, so the on-screen numbers support the averages instead of
+    flashing unrepresentative spikes. Returns (start, impact)."""
+    n_ticks = round(duration / TICK)
+    bk0, b_series = live_fps_series(base_times)
+    ak0, a_series = live_fps_series(app_times)
+    k_lo = max(bk0, ak0)
+    k_hi = min(bk0 + len(b_series), ak0 + len(a_series)) - 1 - n_ticks
+    if k_hi < k_lo:
         print("  warning: captures are shorter than the clip; "
               "starting at the beginning instead of auto-selecting")
-        return lo, None
-    best_t, best_impact = lo, math.inf
-    steps = int((hi - lo) / TICK)
-    for k in range(steps + 1):
-        t = lo + k * TICK
-        b = window_avg_fps(base_times, t, t + duration)
-        a = window_avg_fps(app_times, t, t + duration)
-        impact = (b - a) / b if b > 0 else math.inf
-        if impact < best_impact:
-            best_impact, best_t = impact, t
+        return max(base_times[0], app_times[0]) + WINDOW, None
+    best = None
+    for k in range(k_lo, k_hi + 1):
+        t = k * TICK
+        b_avg = window_avg_fps(base_times, t, t + duration)
+        a_avg = window_avg_fps(app_times, t, t + duration)
+        if b_avg <= 0 or a_avg <= 0:
+            continue
+        impact = (b_avg - a_avg) / b_avg
+        b_ticks = b_series[k - bk0: k - bk0 + n_ticks + 1]
+        a_ticks = a_series[k - ak0: k - ak0 + n_ticks + 1]
+        # Mean relative deviation of the live counters from their own
+        # window averages: high = spiky, misleading numbers.
+        dev = (sum(abs(v - b_avg) for v in b_ticks) / len(b_ticks) / b_avg
+               + sum(abs(v - a_avg) for v in a_ticks) / len(a_ticks) / a_avg)
+        # Deviation of the base-vs-app counter gap from the window's average
+        # gap: high = moments where the two numbers contradict the story.
+        gap = b_avg - a_avg
+        div = (sum(abs((b - a) - gap) for b, a in zip(b_ticks, a_ticks))
+               / len(b_ticks) / b_avg)
+        score = impact + STABILITY_WEIGHT * (dev + div)
+        if best is None or score < best[0]:
+            best = (score, t, impact)
+    _, best_t, best_impact = best
     return best_t, best_impact
 
 
 def build_tick_table(times, start, n_ticks, name):
-    """Live-FPS value for each 0.25s tick, clamped to the capture's range."""
+    """Live-FPS value for each 0.25s tick, clamped to the capture's range.
+    A median-of-3 pass across ticks removes single-tick spikes that would
+    flash numbers wildly off the capture's average."""
     t0, t1 = times[0], times[-1]
     vals, clamped = [], False
     for k in range(n_ticks):
@@ -211,7 +240,11 @@ def build_tick_table(times, start, n_ticks, name):
     if clamped:
         print(f"  warning: {name} ran out of data before the clip ended; "
               "the last live value is held")
-    return vals
+    smoothed = []
+    for i in range(len(vals)):
+        neigh = sorted(vals[max(0, i - 1):i + 2])
+        smoothed.append(neigh[len(neigh) // 2])
+    return smoothed
 
 
 # --------------------------------------------------------------- rendering
@@ -518,17 +551,8 @@ def ask_yn(label, default=False):
     return raw in ("y", "yes")
 
 
-def newest_json(directory):
-    files = sorted(directory.glob("*.json"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
-    if len(files) > 1:
-        print(f"  note: {directory} has {len(files)} .json files; "
-              f"using the newest ({files[0].name})")
-    return files[0] if files else None
-
-
 def discover_games(asset_dir):
-    """Return [(name, base_json, app_json)] for every valid game folder."""
+    """Return [(name, base_jsons, app_jsons)] for every valid game folder."""
     games = []
     for d in sorted(asset_dir.iterdir()):
         if not d.is_dir() or d.name.startswith((".", "_")):
@@ -538,13 +562,40 @@ def discover_games(asset_dir):
             print(f"  skipping {d.name}/ (needs both {BASE_SUBDIR}/ "
                   f"and {APP_SUBDIR}/ subfolders)")
             continue
-        base_json, app_json = newest_json(base_dir), newest_json(app_dir)
-        if base_json is None or app_json is None:
+        base_jsons = sorted(base_dir.glob("*.json"))
+        app_jsons = sorted(app_dir.glob("*.json"))
+        if not base_jsons or not app_jsons:
             print(f"  skipping {d.name}/ (missing a .json capture in "
                   f"{BASE_SUBDIR}/ or {APP_SUBDIR}/)")
             continue
-        games.append((d.name, base_json, app_json))
+        games.append((d.name, base_jsons, app_jsons))
     return games
+
+
+def pick_best_pair(base_files, app_files, duration):
+    """Evaluate every Base x Acrux capture combination and return the
+    (base_file, app_file) pair whose best clip-length window has the
+    smallest FPS impact."""
+    cache = {}
+
+    def load(p):
+        if p not in cache:
+            cache[p] = load_capture(p)
+        return cache[p]
+
+    best = None
+    for bf in base_files:
+        for af in app_files:
+            _, imp = find_best_start(load(bf), load(af), duration)
+            score = math.inf if imp is None else imp
+            if imp is not None:
+                print(f"  {bf.name} vs {af.name}: "
+                      f"best window impact {imp * 100:+.1f}%")
+            if best is None or score < best[0]:
+                best = (score, bf, af)
+    _, bf, af = best
+    print(f"  -> using {BASE_SUBDIR}/{bf.name} vs {APP_SUBDIR}/{af.name}")
+    return bf, af
 
 
 def interactive_config(args):
@@ -564,9 +615,11 @@ def interactive_config(args):
         sys.exit(f"No game folders with captures found.\n{layout_help}")
 
     print("\nAvailable games:")
-    for i, (name, base_json, app_json) in enumerate(games, 1):
-        print(f"  {i}. {name}  ({BASE_SUBDIR}: {base_json.name}, "
-              f"{APP_SUBDIR}: {app_json.name})")
+    for i, (name, base_jsons, app_jsons) in enumerate(games, 1):
+        def describe(files):
+            return files[0].name if len(files) == 1 else f"{len(files)} captures"
+        print(f"  {i}. {name}  ({BASE_SUBDIR}: {describe(base_jsons)}, "
+              f"{APP_SUBDIR}: {describe(app_jsons)})")
     while True:
         raw = ask(f"Pick a game [1-{len(games)}, default 1]: ") or "1"
         if raw.isdigit() and 1 <= int(raw) <= len(games):
@@ -574,7 +627,14 @@ def interactive_config(args):
             break
         print("  please enter a number from the list")
 
-    name, base_json, app_json = games[idx]
+    name, base_jsons, app_jsons = games[idx]
+    if len(base_jsons) == 1 and len(app_jsons) == 1:
+        base_json, app_json = base_jsons[0], app_jsons[0]
+    else:
+        print(f"\nEvaluating {len(base_jsons) * len(app_jsons)} "
+              "capture combinations ...")
+        base_json, app_json = pick_best_pair(base_jsons, app_jsons,
+                                             args.duration)
     args.game = name
     args.base = str(base_json)
     args.app = str(app_json)
