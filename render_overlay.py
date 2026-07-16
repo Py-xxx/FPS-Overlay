@@ -11,7 +11,9 @@ lower-third bar with live-updating FPS / average FPS / impact %, and encodes:
 Usage (direct):
   python render_overlay.py --base baseline.json --app withapp.json \
       --game "Fortnite" --out fortnite_overlay [--green] [--preview] \
-      [--duration 4.0] [--start 10.0]
+      [--duration 8.0] [--start 12.5]
+  Without --start, the clip-length window with the smallest FPS impact is
+  found automatically.
 
 Usage (interactive, e.g. via run_overlay.bat):
   python render_overlay.py
@@ -170,6 +172,32 @@ def impact_text(base_avg, app_avg):
     return f"-{round(impact)}%"
 
 
+def window_avg_fps(times, t0, t1):
+    n = bisect_right(times, t1) - bisect_right(times, t0)
+    return n / (t1 - t0)
+
+
+def find_best_start(base_times, app_times, duration):
+    """Scan both captures (in TICK steps) for the clip-length window where
+    the app's FPS impact vs. baseline is smallest; returns (start, impact)."""
+    lo = max(base_times[0], app_times[0]) + WINDOW
+    hi = min(base_times[-1], app_times[-1]) - duration
+    if hi <= lo:
+        print("  warning: captures are shorter than the clip; "
+              "starting at the beginning instead of auto-selecting")
+        return lo, None
+    best_t, best_impact = lo, math.inf
+    steps = int((hi - lo) / TICK)
+    for k in range(steps + 1):
+        t = lo + k * TICK
+        b = window_avg_fps(base_times, t, t + duration)
+        a = window_avg_fps(app_times, t, t + duration)
+        impact = (b - a) / b if b > 0 else math.inf
+        if impact < best_impact:
+            best_impact, best_t = impact, t
+    return best_t, best_impact
+
+
 def build_tick_table(times, start, n_ticks, name):
     """Live-FPS value for each 0.25s tick, clamped to the capture's range."""
     t0, t1 = times[0], times[-1]
@@ -202,13 +230,18 @@ def tracked_width(draw, text, font, tracking):
             + tracking * (len(text) - 1))
 
 
-def glow_text(layer_size, draw_fn, blur, alpha):
-    """Render draw_fn onto a layer; return (glow_layer, crisp_layer)."""
-    crisp = Image.new("RGBA", layer_size, (0, 0, 0, 0))
-    draw_fn(ImageDraw.Draw(crisp))
-    glow = crisp.filter(ImageFilter.GaussianBlur(blur))
-    a = glow.getchannel("A").point(lambda v: int(v * alpha))
-    glow.putalpha(a)
+def glow_text(layer_size, draw_fn, blur, alpha, color=(255, 255, 255)):
+    """Render draw_fn (which draws onto an L mask with fill=255) and return
+    (glow_layer, crisp_layer) as uniform-color RGBA with the coverage as
+    alpha. Drawing directly onto a transparent RGBA layer instead would
+    darken the antialiased edge pixels (RGB gets scaled by coverage)."""
+    mask = Image.new("L", layer_size, 0)
+    draw_fn(ImageDraw.Draw(mask))
+    crisp = Image.new("RGBA", layer_size, color + (0,))
+    crisp.putalpha(mask)
+    glow = Image.new("RGBA", layer_size, color + (0,))
+    glow.putalpha(mask.filter(ImageFilter.GaussianBlur(blur)).point(
+        lambda v: int(v * alpha)))
     return glow, crisp
 
 
@@ -324,7 +357,7 @@ class BarRenderer:
         for cx in (self.cells[1][0], self.cells[2][0]):
             glow, _ = glow_text(
                 img.size,
-                lambda dd, cx=cx: dd.polygon(divider_poly(cx), fill=WHITE),
+                lambda dd, cx=cx: dd.polygon(divider_poly(cx), fill=255),
                 blur=3 * s, alpha=0.35)
             img.alpha_composite(glow)
             img.alpha_composite(layer(
@@ -338,6 +371,15 @@ class BarRenderer:
             lw = tracked_width(d, label, self.fonts["label"], self.tracking)
             draw_tracked(d, cx - lw / 2, self.label_y, label,
                          self.fonts["label"], LABEL_GREY, self.tracking)
+
+        # "FPS" suffixes are static: same position regardless of the value
+        for i in (0, 1):
+            cell_x, cell_w = self.cells[i]
+            cx = cell_x + cell_w / 2
+            group_w = self.num_box_w + self.num_gap + self.suffix_w
+            d.text((cx + group_w / 2 - self.suffix_w, self.big_baseline),
+                   "FPS", font=self.fonts["suffix"], fill=LABEL_GREY,
+                   anchor="ls")
 
         for i in (0, 1):
             cell_x, cell_w = self.cells[i]
@@ -359,7 +401,7 @@ class BarRenderer:
         glow, crisp = glow_text(
             img.size,
             lambda dd: dd.text((cx, baseline), self.impact,
-                               font=self.fonts["big"], fill=WHITE,
+                               font=self.fonts["big"], fill=255,
                                anchor="ms"),
             blur=6 * s, alpha=0.30)
         img.alpha_composite(glow)
@@ -398,17 +440,17 @@ class BarRenderer:
                 group_w = self.num_box_w + self.num_gap + self.suffix_w
                 box_cx = cx - group_w / 2 + self.num_box_w / 2
                 dd.text((box_cx, self.big_baseline), str(val),
-                        font=self.fonts["big"], fill=WHITE, anchor="ms")
-                dd.text((cx + group_w / 2 - self.suffix_w,
-                         self.big_baseline), "FPS",
-                        font=self.fonts["suffix"], fill=LABEL_GREY,
-                        anchor="ls")
+                        font=self.fonts["big"], fill=255, anchor="ms")
 
         glow, crisp = glow_text(img.size, draw_pair, blur=6 * s, alpha=0.30)
         img.alpha_composite(glow)
         img.alpha_composite(crisp)
 
-        out = img.resize((self.w // s, self.h // s), Image.LANCZOS)
+        # Downscale in premultiplied alpha: resampling straight-alpha RGBA
+        # bleeds the black RGB of transparent neighbors into edge pixels.
+        out = (img.convert("RGBa")
+               .resize((self.w // s, self.h // s), Image.LANCZOS)
+               .convert("RGBA"))
         self._cache[key] = out
         return out
 
@@ -536,14 +578,12 @@ def interactive_config(args):
     args.game = name
     args.base = str(base_json)
     args.app = str(app_json)
-    args.start = ask_float("Start live numbers at (seconds into capture)",
-                           args.start)
 
     slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
     out_dir = script_dir / "output" / name
     args.out = str(out_dir / f"{slug}_overlay")
     print(f"\nGame: {name}   duration: {args.duration}s   "
-          f"start: {args.start}s   output: {args.out}_*\n")
+          f"output: {args.out}_*\n")
 
 
 # ------------------------------------------------------------------ main
@@ -562,9 +602,10 @@ def main():
                          "--out are omitted)")
     ap.add_argument("--duration", type=float, default=8.0,
                     help="clip length in seconds (default 8.0)")
-    ap.add_argument("--start", type=float, default=10.0,
-                    help="offset into the captures for live numbers "
-                         "(default 10.0)")
+    ap.add_argument("--start", type=float, default=None,
+                    help="offset into the captures for live numbers; "
+                         "default: auto-pick the clip-length window where "
+                         "the FPS impact is smallest")
     ap.add_argument("--note", default="RECORDED IN 1080p @ 120 FPS",
                     help="small caption below the bar; pass an empty "
                          "string to disable (default: %(default)s)")
@@ -597,6 +638,14 @@ def main():
     base_avg = avg_fps(base_times)
     app_avg = avg_fps(app_times)
     impact = impact_text(base_avg, app_avg)
+
+    if args.start is None:
+        args.start, win_impact = find_best_start(base_times, app_times,
+                                                 args.duration)
+        if win_impact is not None:
+            print(f"Auto-selected live window: {args.start:.2f}s - "
+                  f"{args.start + args.duration:.2f}s "
+                  f"(impact within window: {win_impact * 100:+.1f}%)")
 
     n_frames = round(args.duration * OUT_FPS)
     n_ticks = math.ceil(args.duration / TICK) + 1
