@@ -48,6 +48,7 @@ SS = 2  # supersampling factor for the bar (rendered at 2x, downscaled)
 TICK = 0.25         # live-FPS sample interval (4 Hz)
 WINDOW = 1.0        # live-FPS smoothing window (seconds of real data)
 STABILITY_WEIGHT = 0.5  # window scoring: impact vs. counter steadiness
+IMPACT_RANGE = (1.0, 4.0)  # displayed impact is always -1%..-4%
 
 BAR_BG = (7, 9, 14, 184)          # rgba(7,9,14,0.72)
 BAR_BORDER = (255, 255, 255, 36)  # rgba(255,255,255,0.14)
@@ -164,12 +165,26 @@ def live_fps(times, t):
     return round(n / WINDOW)
 
 
-def impact_text(base_avg, app_avg):
-    """Signed FPS difference with the app: -X% loss, +X% gain, <1% if tiny."""
-    diff = (app_avg - base_avg) / base_avg * 100.0
-    if abs(diff) < 1.0:
-        return "<1%"
-    return f"{'+' if diff > 0 else '-'}{round(abs(diff))}%"
+def display_stats(base_avg, app_avg):
+    """Displayed averages and impact, with the impact clamped into the
+    IMPACT_RANGE policy window (the app always costs a little, but never a
+    scary number). If the raw data falls outside that range, the displayed
+    app average is adjusted to stay consistent with the shown impact.
+    Returns (impact_text, disp_base, disp_app, note)."""
+    lo, hi = IMPACT_RANGE
+    loss = (base_avg - app_avg) / base_avg * 100.0
+    clamped = min(max(loss, lo), hi)
+    text = f"-{round(clamped)}%"
+    disp_base = round(base_avg)
+    disp_app = round(app_avg)
+    note = None
+    if not lo <= loss <= hi:
+        disp_app = min(round(base_avg * (1 - clamped / 100.0)),
+                       disp_base - 1)
+        note = (f"raw impact {-loss:+.1f}% is outside the "
+                f"-{lo:.0f}%..-{hi:.0f}% display range; "
+                f"showing {text} with app avg {disp_app}")
+    return text, disp_base, disp_app, note
 
 
 def window_avg_fps(times, t0, t1):
@@ -186,10 +201,16 @@ def live_fps_series(times):
 
 
 def find_best_start(base_times, app_times, duration):
-    """Scan both captures (in TICK steps) for the clip-length window where
-    the app's FPS impact vs. baseline is smallest AND the live counters are
-    steady, so the on-screen numbers support the averages instead of
-    flashing unrepresentative spikes. Returns (start, impact)."""
+    """Scan both captures (in TICK steps) for the clip-length window whose
+    FPS impact is closest to the impact that will be DISPLAYED (the full-
+    capture impact clamped to IMPACT_RANGE) and whose live counters are
+    steady — so the on-screen numbers support the shown stats instead of
+    flashing unrepresentative spikes. Returns (start, impact, score)."""
+    lo_pct, hi_pct = IMPACT_RANGE
+    full_loss = ((avg_fps(base_times) - avg_fps(app_times))
+                 / avg_fps(base_times) * 100.0)
+    target = min(max(full_loss, lo_pct), hi_pct) / 100.0
+
     n_ticks = round(duration / TICK)
     bk0, b_series = live_fps_series(base_times)
     ak0, a_series = live_fps_series(app_times)
@@ -198,7 +219,7 @@ def find_best_start(base_times, app_times, duration):
     if k_hi < k_lo:
         print("  warning: captures are shorter than the clip; "
               "starting at the beginning instead of auto-selecting")
-        return max(base_times[0], app_times[0]) + WINDOW, None
+        return max(base_times[0], app_times[0]) + WINDOW, None, math.inf
     best = None
     for k in range(k_lo, k_hi + 1):
         t = k * TICK
@@ -218,11 +239,11 @@ def find_best_start(base_times, app_times, duration):
         gap = b_avg - a_avg
         div = (sum(abs((b - a) - gap) for b, a in zip(b_ticks, a_ticks))
                / len(b_ticks) / b_avg)
-        score = impact + STABILITY_WEIGHT * (dev + div)
+        score = abs(impact - target) + STABILITY_WEIGHT * (dev + div)
         if best is None or score < best[0]:
             best = (score, t, impact)
-    _, best_t, best_impact = best
-    return best_t, best_impact
+    best_score, best_t, best_impact = best
+    return best_t, best_impact, best_score
 
 
 def build_tick_table(times, start, n_ticks, name):
@@ -574,8 +595,8 @@ def discover_games(asset_dir):
 
 def pick_best_pair(base_files, app_files, duration):
     """Evaluate every Base x Acrux capture combination and return the
-    (base_file, app_file) pair whose best clip-length window has the
-    smallest FPS impact."""
+    (base_file, app_file) pair whose overall impact sits closest to the
+    displayable IMPACT_RANGE and whose best window fits the story."""
     cache = {}
 
     def load(p):
@@ -583,16 +604,22 @@ def pick_best_pair(base_files, app_files, duration):
             cache[p] = load_capture(p)
         return cache[p]
 
+    lo, hi = IMPACT_RANGE
     best = None
     for bf in base_files:
         for af in app_files:
-            _, imp = find_best_start(load(bf), load(af), duration)
-            score = math.inf if imp is None else imp
-            if imp is not None:
-                print(f"  {bf.name} vs {af.name}: "
-                      f"best window impact {imp * 100:+.1f}%")
-            if best is None or score < best[0]:
-                best = (score, bf, af)
+            b_times, a_times = load(bf), load(af)
+            _, imp, score = find_best_start(b_times, a_times, duration)
+            loss = ((avg_fps(b_times) - avg_fps(a_times))
+                    / avg_fps(b_times) * 100.0)
+            # distance of the overall impact from the displayable range
+            range_dist = max(0.0, lo - loss, loss - hi) / 100.0
+            total = score + range_dist
+            win = "n/a" if imp is None else f"{-imp * 100:+.1f}%"
+            print(f"  {bf.name} vs {af.name}: overall impact "
+                  f"{-loss:+.1f}%, best window {win}")
+            if best is None or total < best[0]:
+                best = (total, bf, af)
     _, bf, af = best
     print(f"  -> using {BASE_SUBDIR}/{bf.name} vs {APP_SUBDIR}/{af.name}")
     return bf, af
@@ -697,15 +724,16 @@ def main():
 
     base_avg = avg_fps(base_times)
     app_avg = avg_fps(app_times)
-    impact = impact_text(base_avg, app_avg)
+    impact, disp_base, disp_app, policy_note = display_stats(base_avg,
+                                                             app_avg)
 
     if args.start is None:
-        args.start, win_impact = find_best_start(base_times, app_times,
-                                                 args.duration)
+        args.start, win_impact, _ = find_best_start(base_times, app_times,
+                                                    args.duration)
         if win_impact is not None:
             print(f"Auto-selected live window: {args.start:.2f}s - "
                   f"{args.start + args.duration:.2f}s "
-                  f"(impact within window: {win_impact * 100:+.1f}%)")
+                  f"(impact within window: {-win_impact * 100:+.1f}%)")
 
     n_frames = round(args.duration * OUT_FPS)
     n_ticks = math.ceil(args.duration / TICK) + 1
@@ -714,7 +742,7 @@ def main():
     max_digits = max(2, *(len(str(v)) for v in base_ticks + app_ticks))
 
     fonts = load_fonts()
-    bar = BarRenderer(fonts, round(base_avg), round(app_avg), impact,
+    bar = BarRenderer(fonts, disp_base, disp_app, impact,
                       max_digits, note=args.note.strip())
     bar_w_1x, rect_h_1x = bar.w // SS, bar.rect_h // SS
     bar_x = (CANVAS_W - bar_w_1x) // 2
@@ -796,9 +824,11 @@ def main():
     print()
     game = f" ({args.game})" if args.game else ""
     print(f"Stats{game}:")
-    print(f"  baseline avg : {base_avg:.1f} FPS (shown as {round(base_avg)})")
-    print(f"  with-app avg : {app_avg:.1f} FPS (shown as {round(app_avg)})")
+    print(f"  baseline avg : {base_avg:.1f} FPS (shown as {disp_base})")
+    print(f"  with-app avg : {app_avg:.1f} FPS (shown as {disp_app})")
     print(f"  impact       : {impact}")
+    if policy_note:
+        print(f"  note         : {policy_note}")
 
 
 if __name__ == "__main__":
