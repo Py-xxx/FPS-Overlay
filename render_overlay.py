@@ -119,7 +119,7 @@ def load_fonts():
         "suffix": f(big_path, 17 * s),
         "label": f(label_path, 14 * s),
         "avg": f(label_path, 14 * s),
-        "note": f(label_path, 11 * s),
+        "note": f(label_path, 13 * s),
     }
 
 
@@ -224,9 +224,8 @@ class BarRenderer:
         self.rect_h = 118 * s          # the rounded-rect bar itself
         self.note_gap = 8 * s
         # total image height includes the caption hanging below the bar
-        self.h = self.rect_h + (self.note_gap + 16 * s if note else 0)
+        self.h = self.rect_h + (self.note_gap + 20 * s if note else 0)
         self.tracking = round(2.2 * s)
-        self.note_tracking = round(1.6 * s)
 
         probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
         big = fonts["big"]
@@ -253,7 +252,7 @@ class BarRenderer:
         self.w = 2 * self.fps_cell_w + self.impact_cell_w
         if note:
             note_w = tracked_width(probe, note, fonts["note"],
-                                   self.note_tracking)
+                                   self.tracking)
             self.w = max(self.w, int(note_w) + 8 * s)
         x0 = (self.w - (2 * self.fps_cell_w + self.impact_cell_w)) // 2
         self.cells = [
@@ -366,14 +365,21 @@ class BarRenderer:
         img.alpha_composite(glow)
         img.alpha_composite(crisp)
 
-        # Small caption hanging below the bar (e.g. capture format)
+        # Small caption hanging below the bar (e.g. capture format).
+        # It sits over fully transparent pixels, where drawing text directly
+        # darkens antialiased edges (the RGB gets scaled by coverage) and
+        # looks pixelated once composited over footage — so render the
+        # coverage as a mask and apply a uniform color instead.
         if self.note:
-            d = ImageDraw.Draw(img)
-            nw = tracked_width(d, self.note, self.fonts["note"],
-                               self.note_tracking)
-            draw_tracked(d, (self.w - nw) / 2, rh + self.note_gap,
-                         self.note, self.fonts["note"], LABEL_GREY,
-                         self.note_tracking)
+            cov = Image.new("L", img.size, 0)
+            md = ImageDraw.Draw(cov)
+            nw = tracked_width(md, self.note, self.fonts["note"],
+                               self.tracking)
+            draw_tracked(md, (self.w - nw) / 2, rh + self.note_gap,
+                         self.note, self.fonts["note"], 255, self.tracking)
+            note_lay = Image.new("RGBA", img.size, LABEL_GREY[:3] + (0,))
+            note_lay.putalpha(cov)
+            img.alpha_composite(note_lay)
         return img
 
     def render(self, live_base, live_app):
