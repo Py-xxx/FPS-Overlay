@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """render_overlay.py — FPS comparison lower-third overlay renderer.
 
-Reads two CapFrameX capture JSONs (baseline vs. with-app), renders an animated
-lower-third bar comparing live FPS / average FPS / impact %, and encodes:
+Reads two CapFrameX capture JSONs (baseline vs. with-app), renders a static
+lower-third bar with live-updating FPS / average FPS / impact %, and encodes:
 
   {out}_alpha.mov   ProRes 4444 with real alpha  (primary, for NLE compositing)
   {out}_alpha.webm  VP9 with alpha               (lightweight alternative)
@@ -45,7 +45,6 @@ SS = 2  # supersampling factor for the bar (rendered at 2x, downscaled)
 
 TICK = 0.25         # live-FPS sample interval (4 Hz)
 WINDOW = 0.5        # live-FPS smoothing window
-SLIDE = 0.30        # slide-in / slide-out duration
 
 BAR_BG = (7, 9, 14, 184)          # rgba(7,9,14,0.72)
 BAR_BORDER = (255, 255, 255, 36)  # rgba(255,255,255,0.14)
@@ -408,28 +407,6 @@ class BarRenderer:
         return out
 
 
-# -------------------------------------------------------------- animation
-
-def ease_out_back(p, c1=1.0):
-    """Cubic ease-out with a slight overshoot (c1 controls overshoot)."""
-    c3 = c1 + 1
-    return 1 + c3 * (p - 1) ** 3 + c1 * (p - 1) ** 2
-
-
-def bar_top_y(t, duration, bar_h):
-    """Vertical position of the bar's top edge at clip time t."""
-    y_final = CANVAS_H * 0.92 - bar_h   # bottom edge 8% up from frame bottom
-    y_off = CANVAS_H + 2                # fully below frame
-    slide = min(SLIDE, duration / 4)
-    if t < slide:
-        p = ease_out_back(t / slide)
-        return y_off + (y_final - y_off) * p
-    if t > duration - slide:
-        p = (t - (duration - slide)) / slide
-        return y_final + (y_off - y_final) * (p ** 3)
-    return y_final
-
-
 # ---------------------------------------------------------------- ffmpeg
 
 def start_encoder(ffmpeg, in_pix_fmt, out_args, out_path, title, log_dir):
@@ -553,11 +530,8 @@ def interactive_config(args):
     args.game = name
     args.base = str(base_json)
     args.app = str(app_json)
-    args.duration = ask_float("Clip duration in seconds", args.duration)
     args.start = ask_float("Start live numbers at (seconds into capture)",
                            args.start)
-    args.green = ask_yn("Also render a green-screen MP4?", args.green)
-    args.preview = ask_yn("Preview only (3 PNGs, no video)?", args.preview)
 
     slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
     out_dir = script_dir / "output" / name
@@ -580,8 +554,8 @@ def main():
                     help="pick a game from the asset/ directory and be "
                          "prompted for options (default when --base/--app/"
                          "--out are omitted)")
-    ap.add_argument("--duration", type=float, default=4.0,
-                    help="clip length in seconds (default 4.0)")
+    ap.add_argument("--duration", type=float, default=8.0,
+                    help="clip length in seconds (default 8.0)")
     ap.add_argument("--start", type=float, default=10.0,
                     help="offset into the captures for live numbers "
                          "(default 10.0)")
@@ -591,7 +565,7 @@ def main():
     ap.add_argument("--green", action="store_true",
                     help="also render an H.264 green-screen mp4")
     ap.add_argument("--preview", action="store_true",
-                    help="dump 3 preview PNGs instead of rendering video")
+                    help="dump a preview PNG instead of rendering video")
     args = ap.parse_args()
 
     if args.interactive or not (args.base or args.app or args.out):
@@ -630,28 +604,26 @@ def main():
     bar_w_1x, rect_h_1x = bar.w // SS, bar.rect_h // SS
     bar_x = (CANVAS_W - bar_w_1x) // 2
 
+    # Static position: bar bottom edge 8% up from the frame bottom
+    bar_y = round(CANVAS_H * 0.92 - rect_h_1x)
+
     def compose(t):
         """Full transparent 1920x1080 RGBA frame at clip time t."""
         k = min(int(t / TICK), n_ticks - 1)
-        y = bar_top_y(t, args.duration, rect_h_1x)
         canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
-        if y < CANVAS_H:
-            canvas.alpha_composite(bar.render(base_ticks[k], app_ticks[k]),
-                                   (bar_x, round(y)))
-        return canvas, (round(y), base_ticks[k], app_ticks[k])
+        canvas.alpha_composite(bar.render(base_ticks[k], app_ticks[k]),
+                               (bar_x, bar_y))
+        return canvas, (base_ticks[k], app_ticks[k])
 
     title = (f"{args.game} FPS comparison" if args.game
              else "FPS comparison")
 
     if args.preview:
-        slide = min(SLIDE, args.duration / 4)
-        shots = [("in", slide / 2), ("hold", args.duration / 2),
-                 ("out", args.duration - slide / 2)]
-        for name, t in shots:
-            frame, _ = compose(t)
-            path = f"{args.out}_preview_{name}.png"
-            frame.save(path)
-            print(f"  wrote {path}  (t={t:.2f}s)")
+        t = args.duration / 2
+        frame, _ = compose(t)
+        path = f"{args.out}_preview.png"
+        frame.save(path)
+        print(f"  wrote {path}  (t={t:.2f}s)")
     else:
         out_mov = f"{args.out}_alpha.mov"
         out_webm = f"{args.out}_alpha.webm"
