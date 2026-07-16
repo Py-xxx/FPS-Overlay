@@ -120,6 +120,7 @@ def load_fonts():
         "suffix": f(big_path, 17 * s),
         "label": f(label_path, 14 * s),
         "avg": f(label_path, 14 * s),
+        "note": f(label_path, 11 * s),
     }
 
 
@@ -216,12 +217,17 @@ class BarRenderer:
     """Renders the lower-third bar at 2x and caches downscaled 1x images."""
 
     def __init__(self, fonts, base_avg_disp, app_avg_disp, impact,
-                 max_live_digits):
+                 max_live_digits, note=""):
         self.fonts = fonts
         self.impact = impact
+        self.note = note
         s = SS
-        self.h = 118 * s
+        self.rect_h = 118 * s          # the rounded-rect bar itself
+        self.note_gap = 8 * s
+        # total image height includes the caption hanging below the bar
+        self.h = self.rect_h + (self.note_gap + 16 * s if note else 0)
         self.tracking = round(2.2 * s)
+        self.note_tracking = round(1.6 * s)
 
         probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
         big = fonts["big"]
@@ -246,10 +252,15 @@ class BarRenderer:
                                  + 2 * cell_pad)
 
         self.w = 2 * self.fps_cell_w + self.impact_cell_w
+        if note:
+            note_w = tracked_width(probe, note, fonts["note"],
+                                   self.note_tracking)
+            self.w = max(self.w, int(note_w) + 8 * s)
+        x0 = (self.w - (2 * self.fps_cell_w + self.impact_cell_w)) // 2
         self.cells = [
-            (0, self.fps_cell_w),
-            (self.fps_cell_w, self.fps_cell_w),
-            (2 * self.fps_cell_w, self.impact_cell_w),
+            (x0, self.fps_cell_w),
+            (x0 + self.fps_cell_w, self.fps_cell_w),
+            (x0 + 2 * self.fps_cell_w, self.impact_cell_w),
         ]
         # Row geometry (2x px)
         self.label_y = 16 * s
@@ -275,29 +286,30 @@ class BarRenderer:
 
         # All dividers and the tint edge lean along the same skew line:
         # x(y) for the centerline of a divider anchored at cell boundary cx.
-        lean = math.tan(math.radians(12)) * (self.h / 2)
+        rh = self.rect_h
+        lean = math.tan(math.radians(12)) * (rh / 2)
 
         def div_x(cx, y):
-            return cx + lean * (0.5 - y / self.h)
+            return cx + lean * (0.5 - y / rh)
 
         tint_cx = self.cells[2][0]
         content = layer(lambda d: d.rectangle(
-            (0, 0, self.w, self.h), fill=BAR_BG))
+            (0, 0, self.w, rh), fill=BAR_BG))
         content.alpha_composite(layer(lambda d: d.polygon(
             [(div_x(tint_cx, 0), 0), (self.w, 0),
-             (self.w, self.h), (div_x(tint_cx, self.h), self.h)],
+             (self.w, rh), (div_x(tint_cx, rh), rh)],
             fill=IMPACT_TINT)))
 
         # Clip to the rounded-rect silhouette
         mask = Image.new("L", (self.w, self.h), 0)
         ImageDraw.Draw(mask).rounded_rectangle(
-            (0, 0, self.w - 1, self.h - 1), radius=8 * s, fill=255)
+            (0, 0, self.w - 1, rh - 1), radius=8 * s, fill=255)
         content.putalpha(Image.composite(
             content.getchannel("A"), Image.new("L", content.size, 0), mask))
         img.alpha_composite(content)
 
         img.alpha_composite(layer(lambda d: d.rounded_rectangle(
-            (0, 0, self.w - 1, self.h - 1), radius=8 * s,
+            (0, 0, self.w - 1, rh - 1), radius=8 * s,
             outline=BAR_BORDER, width=1 * s)))
 
         # Skewed dividers with a slight glow, on the same line as the tint edge
@@ -306,10 +318,10 @@ class BarRenderer:
 
         def divider_poly(cx):
             top_x = div_x(cx, inset)
-            bot_x = div_x(cx, self.h - inset)
+            bot_x = div_x(cx, rh - inset)
             return [(top_x - half_w, inset), (top_x + half_w, inset),
-                    (bot_x + half_w, self.h - inset),
-                    (bot_x - half_w, self.h - inset)]
+                    (bot_x + half_w, rh - inset),
+                    (bot_x - half_w, rh - inset)]
 
         for cx in (self.cells[1][0], self.cells[2][0]):
             glow, _ = glow_text(
@@ -354,6 +366,15 @@ class BarRenderer:
             blur=6 * s, alpha=0.30)
         img.alpha_composite(glow)
         img.alpha_composite(crisp)
+
+        # Small caption hanging below the bar (e.g. capture format)
+        if self.note:
+            d = ImageDraw.Draw(img)
+            nw = tracked_width(d, self.note, self.fonts["note"],
+                               self.note_tracking)
+            draw_tracked(d, (self.w - nw) / 2, rh + self.note_gap,
+                         self.note, self.fonts["note"], LABEL_GREY,
+                         self.note_tracking)
         return img
 
     def render(self, live_base, live_app):
@@ -564,6 +585,9 @@ def main():
     ap.add_argument("--start", type=float, default=10.0,
                     help="offset into the captures for live numbers "
                          "(default 10.0)")
+    ap.add_argument("--note", default="RECORDED IN 1080p @ 120 FPS",
+                    help="small caption below the bar; pass an empty "
+                         "string to disable (default: %(default)s)")
     ap.add_argument("--green", action="store_true",
                     help="also render an H.264 green-screen mp4")
     ap.add_argument("--preview", action="store_true",
@@ -602,14 +626,14 @@ def main():
 
     fonts = load_fonts()
     bar = BarRenderer(fonts, round(base_avg), round(app_avg), impact,
-                      max_digits)
-    bar_w_1x, bar_h_1x = bar.w // SS, bar.h // SS
+                      max_digits, note=args.note.strip())
+    bar_w_1x, rect_h_1x = bar.w // SS, bar.rect_h // SS
     bar_x = (CANVAS_W - bar_w_1x) // 2
 
     def compose(t):
         """Full transparent 1920x1080 RGBA frame at clip time t."""
         k = min(int(t / TICK), n_ticks - 1)
-        y = bar_top_y(t, args.duration, bar_h_1x)
+        y = bar_top_y(t, args.duration, rect_h_1x)
         canvas = Image.new("RGBA", (CANVAS_W, CANVAS_H), (0, 0, 0, 0))
         if y < CANVAS_H:
             canvas.alpha_composite(bar.render(base_ticks[k], app_ticks[k]),
